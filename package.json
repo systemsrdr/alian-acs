@@ -1,0 +1,7 @@
+{
+  "name": "frete-aliancas-cs",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cotacao Melhor Envio + prazo de confeccao por produto, para o checkout da Shopify"
+}
