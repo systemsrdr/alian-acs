@@ -2,6 +2,24 @@
 // FEED DE PRODUTOS PARA O GOOGLE MERCHANT CENTER
 // URL final: https://sitealiancacs.vercel.app/api/feed-google
 //
+// VERSÃO 2, de 26/10/2026: SEM TOKEN
+//   A primeira versão lia a API de administrador da Shopify e exigia um app
+//   privado com token. O Dev Dashboard novo da Shopify não completou a
+//   instalação do app, então esta versão lê o catálogo pelo endereço PÚBLICO
+//   da loja, que não pede autenticação nenhuma:
+//
+//     https://aliancascs.com.br/products.json?limit=250&page=1
+//
+//   Vantagens de ter mudado:
+//     - nenhuma credencial para guardar, vazar ou vencer
+//     - aparecem SÓ os produtos publicados na loja virtual, que é o que o
+//       Google deve anunciar de qualquer forma
+//
+//   O que se perdeu:
+//     - o endereço público não devolve metacampo, então o filtro pelo
+//       seo.hidden deixou de funcionar. No lugar entrou a TAG `sem-google`,
+//       que faz o mesmo papel e é mais fácil de usar no dia a dia.
+//
 // POR QUE ESTE ARQUIVO EXISTE
 //   A conexão nativa Shopify <-> Merchant Center não deixa controlar duas
 //   coisas que importam muito nesta loja:
@@ -16,22 +34,23 @@
 //      fora. Brinde anunciado no Shopping seria comprado sozinho, que é
 //      exatamente o que a mecânica da campanha quer impedir.
 //
+// COMO TIRAR UM PRODUTO DO GOOGLE SEM MEXER EM CÓDIGO
+//   Põe a tag `sem-google` no produto, dentro da Shopify. Ele some do feed
+//   na próxima busca do Google e continua à venda na loja normalmente.
+//
 // COMO O GOOGLE USA
 //   Merchant Center -> Fontes de dados -> Adicionar produtos com um arquivo
 //   -> Inserir um link para o arquivo -> cola a URL acima.
 //   O Google vem buscar sozinho, uma vez por dia. Nós não empurramos nada.
 //
-// VARIÁVEIS DE AMBIENTE (painel da Vercel, nunca no código)
-//   SHOPIFY_LOJA      aliancas-cs.myshopify.com
-//   SHOPIFY_TOKEN     token do app privado, escopo read_products
-//   SHOPIFY_API_VER   opcional, padrão abaixo
-//   FEED_USUARIO      opcional, usuário para proteger o feed
-//   FEED_SENHA        opcional, senha para proteger o feed
+// VARIÁVEIS DE AMBIENTE
+//   Nenhuma obrigatória. As três do app privado (SHOPIFY_LOJA, SHOPIFY_TOKEN,
+//   SHOPIFY_API_VER) não são mais usadas e podem ser apagadas da Vercel.
 //
-//   Se FEED_USUARIO e FEED_SENHA estiverem preenchidos, o feed passa a exigir
-//   autenticação básica, e os mesmos dados vão no campo "Adicionar informações
-//   de autenticação" do Merchant Center. Sem isso, o catálogo inteiro fica
-//   legível por qualquer um que descubra a URL.
+//   FEED_USUARIO e FEED_SENHA, se preenchidas, passam a exigir autenticação
+//   básica no feed, e os mesmos dados vão no campo "Adicionar informações de
+//   autenticação" do Merchant Center. Sem isso, o catálogo fica legível por
+//   qualquer um que descubra a URL.
 //
 // CONFERIR
 //   /api/feed-google?debug=1   devolve a contagem em JSON, sem o XML.
@@ -47,6 +66,7 @@ export const maxDuration = 60;
 const LOJA_PUBLICA = 'https://aliancascs.com.br';
 const MOEDA = 'BRL';
 const MARCA_PADRAO = 'Alianças CS';
+const POR_PAGINA = 250;
 
 // Trânsito da opção GRATUITA, que é a mais lenta e a que o Merchant Center
 // declara no custo de frete. Não usar prazo de SEDEX aqui: prometer data de
@@ -58,6 +78,9 @@ const TRANSITO_MAX = 12;
 const HANDLES_FORA = new Set([
   'personalizacoes-aliancas-cs',
 ]);
+
+// A tag que a cliente pode usar para tirar qualquer produto do Google.
+const TAG_FORA = 'sem-google';
 
 // ----------------------------------------------------------------------------
 // Utilidades
@@ -85,96 +108,44 @@ function textoLimpo(html, limite = 4800) {
   return t.length > limite ? t.slice(0, limite - 3).trim() + '...' : t;
 }
 
-// gid://shopify/ProductVariant/123 -> 123
-function soNumero(gid) {
-  const m = String(gid || '').match(/(\d+)\s*$/);
-  return m ? m[1] : '';
-}
-
 function dinheiro(valor) {
   const n = Number(valor);
   if (!isFinite(n)) { return ''; }
   return n.toFixed(2) + ' ' + MOEDA;
 }
 
-// ----------------------------------------------------------------------------
-// Shopify
-// ----------------------------------------------------------------------------
+function listaDeTags(p) {
+  // products.json devolve tags como array em algumas versões e como string
+  // separada por vírgula em outras. Aceita as duas.
+  const cru = p.tags;
+  const bruto = Array.isArray(cru) ? cru : String(cru || '').split(',');
+  return bruto.map(function (t) { return String(t).trim().toLowerCase(); });
+}
 
-const CONSULTA = `
-  query feed($cursor: String) {
-    products(first: 50, after: $cursor, query: "status:active") {
-      pageInfo { hasNextPage endCursor }
-      nodes {
-        id
-        handle
-        title
-        vendor
-        productType
-        onlineStoreUrl
-        descriptionHtml
-        oculto: metafield(namespace: "seo", key: "hidden") { value }
-        featuredImage { url }
-        images(first: 6) { nodes { url } }
-        variants(first: 100) {
-          nodes {
-            id
-            title
-            sku
-            availableForSale
-            price
-            compareAtPrice
-            image { url }
-          }
-        }
-      }
-    }
-  }
-`;
-
+// ----------------------------------------------------------------------------
+// Catálogo público da Shopify
+// ----------------------------------------------------------------------------
 async function buscarProdutos() {
-  const loja = process.env.SHOPIFY_LOJA;
-  const token = process.env.SHOPIFY_TOKEN;
-  const versao = process.env.SHOPIFY_API_VER || '2026-07';
-
-  if (!loja || !token) {
-    throw new Error('Falta SHOPIFY_LOJA ou SHOPIFY_TOKEN nas variáveis de ambiente da Vercel.');
-  }
-
-  const url = `https://${loja}/admin/api/${versao}/graphql.json`;
   const todos = [];
-  let cursor = null;
-  let paginas = 0;
 
-  // Trava de segurança: 40 páginas são 2000 produtos. Se um dia passar disso,
-  // é melhor o feed avisar do que girar até estourar o tempo de execução.
-  while (paginas < 40) {
+  // 12 páginas de 250 são 3000 produtos. Trava de segurança para o dia em que
+  // alguém cadastrar muito mais do que a gente espera.
+  for (let pagina = 1; pagina <= 12; pagina += 1) {
+    const url = `${LOJA_PUBLICA}/products.json?limit=${POR_PAGINA}&page=${pagina}`;
     const resposta = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token,
-      },
-      body: JSON.stringify({ query: CONSULTA, variables: { cursor } }),
+      headers: { 'Accept': 'application/json' },
     });
 
     if (!resposta.ok) {
-      throw new Error(`Shopify respondeu ${resposta.status} na página ${paginas + 1}.`);
+      throw new Error(`A loja respondeu ${resposta.status} na página ${pagina}.`);
     }
 
     const corpo = await resposta.json();
-    if (corpo.errors) {
-      throw new Error('Shopify: ' + JSON.stringify(corpo.errors).slice(0, 300));
-    }
+    const lote = (corpo && corpo.products) || [];
+    if (!lote.length) { break; }
 
-    const bloco = corpo.data && corpo.data.products;
-    if (!bloco) { break; }
-
-    todos.push(...bloco.nodes);
-    paginas += 1;
-
-    if (!bloco.pageInfo.hasNextPage) { break; }
-    cursor = bloco.pageInfo.endCursor;
+    todos.push(...lote);
+    if (lote.length < POR_PAGINA) { break; }
   }
 
   return todos;
@@ -188,11 +159,21 @@ async function buscarProdutos() {
 // ----------------------------------------------------------------------------
 function motivoParaExcluir(p) {
   if (HANDLES_FORA.has(p.handle)) { return 'handle na lista de exclusão'; }
-  if (!p.onlineStoreUrl) { return 'não publicado na loja virtual'; }
-  if (p.oculto && String(p.oculto.value).trim() === '1') { return 'metacampo seo.hidden = 1'; }
+  if (listaDeTags(p).includes(TAG_FORA)) { return `tag ${TAG_FORA}`; }
   if (classificar(p.title).tipo === 'Brinde') { return 'é brinde'; }
-  if (!p.featuredImage || !p.featuredImage.url) { return 'sem imagem'; }
+  if (!p.images || !p.images.length || !p.images[0].src) { return 'sem imagem'; }
+  if (!p.variants || !p.variants.length) { return 'sem variação'; }
   return null;
+}
+
+// Imagem da variação, quando ela tem uma só dela. Senão, a primeira do produto.
+function imagemDaVariacao(p, v) {
+  const achou = (p.images || []).find(function (img) {
+    return Array.isArray(img.variant_ids) && img.variant_ids.indexOf(v.id) !== -1;
+  });
+  if (achou && achou.src) { return achou.src; }
+  if (v.featured_image && v.featured_image.src) { return v.featured_image.src; }
+  return p.images[0].src;
 }
 
 // ----------------------------------------------------------------------------
@@ -213,37 +194,34 @@ function montarItens(produtos, contagem) {
     const dias = info.dias;
     contagem.porPrazo[dias] = (contagem.porPrazo[dias] || 0) + 1;
 
-    const descricao = textoLimpo(p.descriptionHtml) || p.title;
-    const marca = (p.vendor || '').trim() || MARCA_PADRAO;
-    const extras = (p.images && p.images.nodes ? p.images.nodes : [])
-      .map(function (i) { return i.url; })
-      .filter(function (u) { return u && u !== p.featuredImage.url; })
+    const descricao = textoLimpo(p.body_html) || p.title;
+    const marca = String(p.vendor || '').trim() || MARCA_PADRAO;
+    const principal = p.images[0].src;
+    const extras = p.images
+      .map(function (i) { return i.src; })
+      .filter(function (u) { return u && u !== principal; })
       .slice(0, 10);
 
-    const idProduto = soNumero(p.id);
-    const variantes = (p.variants && p.variants.nodes) || [];
-
-    variantes.forEach(function (v) {
-      const idVariante = soNumero(v.id);
-      if (!idVariante) { return; }
+    p.variants.forEach(function (v) {
+      if (!v || !v.id) { return; }
 
       const temNome = v.title && v.title !== 'Default Title';
       const titulo = temNome ? `${p.title} - ${v.title}` : p.title;
 
       const preco = Number(v.price);
-      const de = Number(v.compareAtPrice);
-      // compareAtPrice só vira "preço cheio" se for MAIOR que o preço atual.
+      const de = Number(v.compare_at_price);
+      // compare_at_price só vira "preço cheio" se for MAIOR que o preço atual.
       const temPromocao = isFinite(de) && de > preco;
 
       itens.push({
-        id: idVariante,
-        item_group_id: variantes.length > 1 ? idProduto : '',
+        id: String(v.id),
+        item_group_id: p.variants.length > 1 ? String(p.id) : '',
         title: titulo.slice(0, 150),
         description: descricao,
-        link: `${LOJA_PUBLICA}/products/${p.handle}?variant=${idVariante}`,
-        image_link: v.image && v.image.url ? v.image.url : p.featuredImage.url,
+        link: `${LOJA_PUBLICA}/products/${p.handle}?variant=${v.id}`,
+        image_link: imagemDaVariacao(p, v),
         additional_image_link: extras,
-        availability: v.availableForSale ? 'in_stock' : 'out_of_stock',
+        availability: v.available ? 'in_stock' : 'out_of_stock',
         price: temPromocao ? dinheiro(de) : dinheiro(preco),
         sale_price: temPromocao ? dinheiro(preco) : '',
         brand: marca,
@@ -252,7 +230,7 @@ function montarItens(produtos, contagem) {
         // reprova por "identificador ausente".
         identifier_exists: 'no',
         mpn: v.sku || '',
-        product_type: p.productType || info.tipo,
+        product_type: p.product_type || info.tipo,
         custom_label_0: info.tipo,
         custom_label_1: `confeccao-${dias}d`,
         min_handling_time: dias,
@@ -371,7 +349,8 @@ export default async function handler(req, res) {
       res.setHeader('Cache-Control', 'no-store');
       return res.status(200).json({
         ok: true,
-        produtosNaLoja: contagem.produtos,
+        fonte: 'products.json publico, sem token',
+        produtosPublicados: contagem.produtos,
         itensNoFeed: contagem.itens,
         excluidos: contagem.excluidos,
         itensPorPrazoDeConfeccao: contagem.porPrazo,
@@ -380,7 +359,7 @@ export default async function handler(req, res) {
     }
 
     // O Google busca uma vez por dia. O cache da Vercel evita que uma visita
-    // curiosa à URL dispare 19 chamadas na API da Shopify.
+    // curiosa à URL dispare 4 chamadas na loja.
     res.setHeader('Content-Type', 'application/xml; charset=utf-8');
     res.setHeader('Cache-Control', 'public, s-maxage=21600, stale-while-revalidate=86400');
     return res.status(200).send(montarXml(itens));
