@@ -79,6 +79,18 @@ const HANDLES_FORA = new Set([
   'personalizacoes-aliancas-cs',
 ]);
 
+// Rede de segurança do prazo.
+//
+// classificar() devolve o prazo de confecção, e em 26/10/2026 trinta e quatro
+// produtos voltaram com prazo vazio, provavelmente porque a versão publicada
+// de lib/calculo.js é anterior à daqui. Item com prazo vazio é reprovado pelo
+// Google, então aqui ele cai no prazo da aliança, que é o mais longo entre os
+// comuns. Errar para mais atrasa a promessa; errar para menos promete o que a
+// fábrica não cumpre.
+//
+// O debug lista os títulos afetados em "semPrazoDeConfeccao".
+const PRAZO_DE_SOCORRO = 10;
+
 // A tag que a cliente pode usar para tirar qualquer produto do Google.
 const TAG_FORA = 'sem-google';
 
@@ -191,7 +203,16 @@ function montarItens(produtos, contagem) {
 
     // O prazo sai da MESMA função que o checkout usa. Não duplicar a regra.
     const info = classificar(p.title);
-    const dias = info.dias;
+    // Atenção ao >= 1 e não > 0: em JavaScript Number(null) e Number('') dão
+    // ZERO, que é finito e passaria direto, prometendo entrega no mesmo dia.
+    // Nenhum produto desta loja sai da fábrica em menos de um dia útil.
+    let dias = Number(info.dias);
+    if (!Number.isFinite(dias) || dias < 1) {
+      dias = PRAZO_DE_SOCORRO;
+      if (contagem.semPrazo.length < 60) {
+        contagem.semPrazo.push(p.title);
+      }
+    }
     contagem.porPrazo[dias] = (contagem.porPrazo[dias] || 0) + 1;
 
     const descricao = textoLimpo(p.body_html) || p.title;
@@ -335,7 +356,7 @@ export default async function handler(req, res) {
     return res.status(401).send('Nao autorizado');
   }
 
-  const contagem = { produtos: 0, excluidos: {}, porPrazo: {}, itens: 0 };
+  const contagem = { produtos: 0, excluidos: {}, porPrazo: {}, itens: 0, semPrazo: [] };
 
   try {
     const produtos = await buscarProdutos();
@@ -354,6 +375,8 @@ export default async function handler(req, res) {
         itensNoFeed: contagem.itens,
         excluidos: contagem.excluidos,
         itensPorPrazoDeConfeccao: contagem.porPrazo,
+        quantosSemPrazo: contagem.semPrazo.length,
+        semPrazoDeConfeccao: contagem.semPrazo,
         exemplo: itens[0] || null,
       });
     }
